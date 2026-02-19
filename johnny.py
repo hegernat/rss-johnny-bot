@@ -349,7 +349,7 @@ async def check_feed(feed):
         update_last_checked(feed_id)
 
     except Exception as e:
-        log.error(f"Error checking feed '{name}': {e}"
+        log.error(f"Error checking feed '{name}': {e}")
 
 
 # ----------------------
