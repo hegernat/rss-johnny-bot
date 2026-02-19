@@ -28,6 +28,7 @@ MIN_INTERVAL = 60
 MAX_INTERVAL = 86400
 MAX_POSTS_PER_CHECK = 5
 MAX_LATEST_COUNT = 5
+MAX_DESCRIPTION_LENGTH = 3500
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN missing in .env")
@@ -114,7 +115,7 @@ def add_feed(guild_id, name, rss_url, channel_id, interval):
     latest_timestamp = None
 
     for entry in entries:
-        if entry.get("published_parsed"):
+        if entry.get("published_parsed") or entry.get("updated_parsed"):
             dt = datetime(*entry["published_parsed"][:6])
             ts = dt.timestamp()
             if not latest_timestamp or ts > latest_timestamp:
@@ -214,11 +215,21 @@ def update_last_checked(feed_id):
 def validate_rss(url):
     try:
         parsed = feedparser.parse(url)
-        if parsed.bozo:
-            return False, "Invalid RSS structure."
+
         if not parsed.entries:
             return False, "Feed contains no entries."
+
+        # Kolla att minst en entry har timestamp
+        has_timestamp = any(
+            entry.get("published_parsed") or entry.get("updated_parsed")
+            for entry in parsed.entries
+        )
+
+        if not has_timestamp:
+            return False, "Feed contains no valid timestamps."
+
         return True, None
+
     except Exception as e:
         return False, str(e)
 
@@ -230,7 +241,7 @@ def clean_entry(entry):
     title = entry.get("title", "No title")
     link = entry.get("link")
     description = entry.get("summary") or entry.get("description") or ""
-    time_struct = entry.get("published_parsed")
+    time_struct = entry.get("published_parsed") or entry.get("updated_parsed")
 
     soup = BeautifulSoup(description, "html.parser")
 
@@ -246,8 +257,8 @@ def clean_entry(entry):
             a.replace_with(text)
 
     text = soup.get_text().strip()
-    if len(text) > 2000:
-        text = text[:1997] + "..."
+    if len(text) > MAX_DESCRIPTION_LENGTH:
+        text = text[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
     return {
         "title": title,
@@ -285,8 +296,7 @@ async def post_entry(channel, entry):
 
 
 async def check_feed(feed):
-    feed_id, name, rss_url, channel_id, last_time, interval, last_checked = feed
-
+    feed_id, guild_id, name, rss_url, channel_id, last_time, interval, last_checked = feed
     now = time.time()
 
     # If feed has never been initialized, initialize silently
@@ -296,7 +306,7 @@ async def check_feed(feed):
 
         latest_ts = None
         for entry in entries:
-            if entry.get("published_parsed"):
+            if entry.get("published_parsed") or entry.get("updated_parsed"):
                 dt = datetime(*entry["published_parsed"][:6])
                 ts = dt.timestamp()
                 if not latest_ts or ts > latest_ts:
@@ -369,13 +379,10 @@ async def check_feed(feed):
         for entry in new_entries:
             await post_entry(channel, entry)
 
-        # Update last_time ONLY if we posted something
-        if new_entries:
-            latest_dt = entry_to_datetime(new_entries[-1])
-            if latest_dt:
-                update_last_time(feed_id, latest_dt)
-                log.info(f"Feed '{name}': posted {len(new_entries)} new entries")
-
+        # Always sync to latest timestamp in feed
+        latest_feed_dt = valid_entries[-1][0]
+        update_last_time(feed_id, latest_feed_dt)
+        
         update_last_checked(feed_id)
 
     except Exception as e:
