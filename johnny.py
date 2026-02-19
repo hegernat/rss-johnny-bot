@@ -6,11 +6,10 @@ import random
 import time
 import logging
 from logging.handlers import RotatingFileHandler
-
 import discord
 import feedparser
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, UTC
 from zoneinfo import ZoneInfo
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -76,10 +75,22 @@ def init_db():
             last_time REAL,
             interval_seconds INTEGER NOT NULL,
             last_checked REAL,
+            last_entry_id TEXT,
             UNIQUE(guild_id, name)
         )
     """)
 
+    conn.commit()
+    conn.close()
+
+
+def update_last_entry_id(feed_id, entry_id):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE feeds SET last_entry_id = ? WHERE id = ?",
+        (entry_id, feed_id)
+    )
     conn.commit()
     conn.close()
 
@@ -115,11 +126,13 @@ def add_feed(guild_id, name, rss_url, channel_id, interval):
     latest_timestamp = None
 
     for entry in entries:
-        if entry.get("published_parsed") or entry.get("updated_parsed"):
-            dt = datetime(*entry["published_parsed"][:6])
+        time_struct = entry.get("published_parsed") or entry.get("updated_parsed")
+        if time_struct:
+            dt = datetime(*time_struct[:6])
             ts = dt.timestamp()
             if not latest_timestamp or ts > latest_timestamp:
                 latest_timestamp = ts
+
 
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
@@ -160,32 +173,38 @@ def remove_feed(guild_id, name):
     conn.close()
 
 
-def update_feed(name, rss_url=None, channel_id=None, interval=None):
-    feed = get_feed_by_name(name)
+def update_feed(guild_id, name, rss_url=None, channel_id=None, interval=None):
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT * FROM feeds WHERE guild_id = ? AND name = ?",
+        (guild_id, name)
+    )
+    feed = cur.fetchone()
+
     if not feed:
+        conn.close()
         return False
 
-    _, _, old_url, old_channel, last_time, old_interval, last_checked = feed
+    feed_id = feed[0]
+    old_url = feed[3]
+    old_channel = feed[4]
+    old_interval = feed[6]
 
     new_url = rss_url if rss_url else old_url
     new_channel = channel_id if channel_id else old_channel
-    new_interval = old_interval
+    new_interval = max(MIN_INTERVAL, min(interval, MAX_INTERVAL)) if interval else old_interval
 
-    if interval:
-        new_interval = max(MIN_INTERVAL, min(interval, MAX_INTERVAL))
-
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
     cur.execute("""
         UPDATE feeds
         SET rss_url = ?, channel_id = ?, interval_seconds = ?
-        WHERE name = ?
-    """, (new_url, new_channel, new_interval, name))
+        WHERE id = ?
+    """, (new_url, new_channel, new_interval, feed_id))
 
     conn.commit()
     conn.close()
     return True
-
 
 def update_last_time(feed_id, dt):
     conn = sqlite3.connect(DB_FILE)
@@ -270,9 +289,9 @@ def clean_entry(entry):
 
 def entry_to_datetime(entry):
     if entry["time"]:
-        return datetime(*entry["time"][:6])
+        return datetime(*entry["time"][:6], tzinfo=UTC)
     return None
-
+    
 
 def format_time(dt_struct):
     if not dt_struct:
@@ -296,30 +315,10 @@ async def post_entry(channel, entry):
 
 
 async def check_feed(feed):
-    feed_id, guild_id, name, rss_url, channel_id, last_time, interval, last_checked = feed
+    feed_id, guild_id, name, rss_url, channel_id, last_time, interval, last_checked, last_entry_id = feed
     now = time.time()
 
-    # If feed has never been initialized, initialize silently
-    if last_time is None:
-        parsed = feedparser.parse(rss_url)
-        entries = parsed.entries if parsed.entries else []
-
-        latest_ts = None
-        for entry in entries:
-            if entry.get("published_parsed") or entry.get("updated_parsed"):
-                dt = datetime(*entry["published_parsed"][:6])
-                ts = dt.timestamp()
-                if not latest_ts or ts > latest_ts:
-                    latest_ts = ts
-
-        if latest_ts:
-            update_last_time(feed_id, datetime.utcfromtimestamp(latest_ts))
-            log.info(f"Feed '{name}' initialized without backlog posting")
-
-        update_last_checked(feed_id)
-        return
-
-    # Interval check
+    # Respect interval
     if last_checked and now - last_checked < interval:
         return
 
@@ -335,54 +334,67 @@ async def check_feed(feed):
             update_last_checked(feed_id)
             return
 
-        # Clean + filter entries WITH timestamps only
         valid_entries = []
 
         for raw in entries:
-            if not raw.get("published_parsed"):
+            time_struct = raw.get("published_parsed") or raw.get("updated_parsed")
+            if not time_struct:
                 continue
 
             cleaned = clean_entry(raw)
             entry_dt = entry_to_datetime(cleaned)
 
-            if entry_dt:
-                valid_entries.append((entry_dt, cleaned))
+            if not entry_dt:
+                continue
+
+            entry_id = raw.get("id") or raw.get("link")
+            if not entry_id:
+                continue
+
+            valid_entries.append((entry_dt, cleaned, entry_id))
 
         if not valid_entries:
-            log.warning(f"Feed '{name}' has no valid timestamped entries")
             update_last_checked(feed_id)
             return
 
         # Sort oldest → newest
         valid_entries.sort(key=lambda x: x[0])
 
-        # If last_time is None (should not happen after v1.0.1),
-        # initialize it safely to newest timestamp and exit
-        if not last_time:
-            newest_dt = valid_entries[-1][0]
-            update_last_time(feed_id, newest_dt)
+        # First-time init: never post backlog
+        if last_time is None:
+            latest_dt, _, latest_id = valid_entries[-1]
+            update_last_time(feed_id, latest_dt)
+            update_last_entry_id(feed_id, latest_id)
             update_last_checked(feed_id)
-            log.info(f"Feed '{name}' initialized with latest timestamp")
+            log.info(f"Feed '{name}' initialized without backlog posting")
             return
 
-        stored_dt = datetime.utcfromtimestamp(last_time)
+        stored_dt = datetime.fromtimestamp(last_time, UTC)
+        new_entries = []
 
-        # Collect only entries newer than stored timestamp
-        new_entries = [
-            entry for dt, entry in valid_entries
-            if dt > stored_dt
-        ]
+        for dt, entry, entry_id in valid_entries:
+            # Skip already posted ID
+            if last_entry_id and entry_id == last_entry_id:
+                continue
 
-        # Anti-flood cap
+            # Skip older timestamps
+            if dt <= stored_dt:
+                continue
+
+            new_entries.append((dt, entry, entry_id))
+
+        # Anti-flood
         new_entries = new_entries[:MAX_POSTS_PER_CHECK]
 
-        for entry in new_entries:
+        for dt, entry, entry_id in new_entries:
             await post_entry(channel, entry)
 
-        # Always sync to latest timestamp in feed
-        latest_feed_dt = valid_entries[-1][0]
-        update_last_time(feed_id, latest_feed_dt)
-        
+        if new_entries:
+            last_dt, _, last_id = new_entries[-1]
+            update_last_time(feed_id, last_dt)
+            update_last_entry_id(feed_id, last_id)
+            log.info(f"Feed '{name}': posted {len(new_entries)} new entries")
+
         update_last_checked(feed_id)
 
     except Exception as e:
@@ -502,14 +514,23 @@ async def removefeed(interaction: discord.Interaction, name: str):
 
 @tree.command(name="listfeeds", description="List configured feeds")
 async def listfeeds(interaction: discord.Interaction):
-    feeds = get_all_feeds()
-    if not feeds:
+    guild_id = interaction.guild.id
+
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, channel_id, interval_seconds FROM feeds WHERE guild_id = ?",
+        (guild_id,)
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
         await interaction.response.send_message("No feeds configured.", ephemeral=True)
         return
 
     msg = ""
-    for feed in feeds:
-        _, name, _, channel_id, _, interval, _ = feed
+    for name, channel_id, interval in rows:
         msg += f"{name} | <#{channel_id}> | every {interval}s\n"
 
     await interaction.response.send_message(msg, ephemeral=True)
@@ -532,7 +553,7 @@ async def latest(interaction: discord.Interaction,
 
     count = min(count, MAX_LATEST_COUNT)
 
-    _, _, _, rss_url, _, _, _, _ = feed
+    feed_id, guild_id, name, rss_url, channel_id, last_time, interval, last_checked, last_entry_id = feed
 
     parsed = feedparser.parse(rss_url)
     entries = parsed.entries if parsed.entries else []
