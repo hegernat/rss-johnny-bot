@@ -1,0 +1,22 @@
+# Environment
+.env
+
+# Database
+johnny.db
+*.db
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
+venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
