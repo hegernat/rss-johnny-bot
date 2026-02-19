@@ -68,12 +68,14 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS feeds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            guild_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
             rss_url TEXT NOT NULL,
             channel_id INTEGER NOT NULL,
             last_time REAL,
             interval_seconds INTEGER NOT NULL,
-            last_checked REAL
+            last_checked REAL,
+            UNIQUE(guild_id, name)
         )
     """)
 
@@ -90,16 +92,19 @@ def get_all_feeds():
     return rows
 
 
-def get_feed_by_name(name):
+def get_feed_by_name(guild_id, name):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("SELECT * FROM feeds WHERE name = ?", (name,))
+    cur.execute(
+        "SELECT * FROM feeds WHERE guild_id = ? AND name = ?",
+        (guild_id, name)
+    )
     row = cur.fetchone()
     conn.close()
     return row
 
 
-def add_feed(name, rss_url, channel_id, interval):
+def add_feed(guild_id, name, rss_url, channel_id, interval):
     interval = max(MIN_INTERVAL, min(interval, MAX_INTERVAL))
     now = time.time()
 
@@ -120,6 +125,7 @@ def add_feed(name, rss_url, channel_id, interval):
 
     cur.execute("""
         INSERT INTO feeds (
+            guild_id,
             name,
             rss_url,
             channel_id,
@@ -127,8 +133,9 @@ def add_feed(name, rss_url, channel_id, interval):
             interval_seconds,
             last_checked
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
+        guild_id,
         name,
         rss_url,
         channel_id,
@@ -141,10 +148,13 @@ def add_feed(name, rss_url, channel_id, interval):
     conn.close()
 
 
-def remove_feed(name):
+def remove_feed(guild_id, name):
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
-    cur.execute("DELETE FROM feeds WHERE name = ?", (name,))
+    cur.execute(
+        "DELETE FROM feeds WHERE guild_id = ? AND name = ?",
+        (guild_id, name)
+    )
     conn.commit()
     conn.close()
 
@@ -279,6 +289,26 @@ async def check_feed(feed):
 
     now = time.time()
 
+    # If feed has never been initialized, initialize silently
+    if last_time is None:
+        parsed = feedparser.parse(rss_url)
+        entries = parsed.entries if parsed.entries else []
+
+        latest_ts = None
+        for entry in entries:
+            if entry.get("published_parsed"):
+                dt = datetime(*entry["published_parsed"][:6])
+                ts = dt.timestamp()
+                if not latest_ts or ts > latest_ts:
+                    latest_ts = ts
+
+        if latest_ts:
+            update_last_time(feed_id, datetime.utcfromtimestamp(latest_ts))
+            log.info(f"Feed '{name}' initialized without backlog posting")
+
+        update_last_checked(feed_id)
+        return
+
     # Interval check
     if last_checked and now - last_checked < interval:
         return
@@ -379,10 +409,13 @@ async def on_ready():
 # ----------------------
 @tree.command(name="addfeed", description="Add a new RSS feed")
 @app_commands.checks.has_permissions(administrator=True)
-async def addfeed(interaction: discord.Interaction, name: str,
+async def addfeed(interaction: discord.Interaction,
+                  name: str,
                   rss_url: str,
                   channel: discord.TextChannel,
                   interval_seconds: int = 600):
+
+    guild_id = interaction.guild.id
 
     valid, error = validate_rss(rss_url)
     if not valid:
@@ -393,25 +426,28 @@ async def addfeed(interaction: discord.Interaction, name: str,
         return
 
     try:
-        add_feed(name, rss_url, channel.id, interval_seconds)
-        log.info(f"Feed added: {name}")
+        add_feed(guild_id, name, rss_url, channel.id, interval_seconds)
+        log.info(f"Feed added: {name} (guild {guild_id})")
         await interaction.response.send_message(
             f"Feed '{name}' added.",
             ephemeral=True
         )
     except sqlite3.IntegrityError:
         await interaction.response.send_message(
-            "Feed name already exists.",
+            "Feed name already exists in this server.",
             ephemeral=True
         )
 
 
 @tree.command(name="editfeed", description="Edit existing feed")
 @app_commands.checks.has_permissions(administrator=True)
-async def editfeed(interaction: discord.Interaction, name: str,
+async def editfeed(interaction: discord.Interaction,
+                   name: str,
                    new_url: str = None,
                    new_channel: discord.TextChannel = None,
                    new_interval: int = None):
+
+    guild_id = interaction.guild.id
 
     if new_url:
         valid, error = validate_rss(new_url)
@@ -423,6 +459,7 @@ async def editfeed(interaction: discord.Interaction, name: str,
             return
 
     success = update_feed(
+        guild_id,
         name,
         rss_url=new_url,
         channel_id=new_channel.id if new_channel else None,
@@ -430,14 +467,14 @@ async def editfeed(interaction: discord.Interaction, name: str,
     )
 
     if success:
-        log.info(f"Feed updated: {name}")
+        log.info(f"Feed updated: {name} (guild {guild_id})")
         await interaction.response.send_message(
             f"Feed '{name}' updated.",
             ephemeral=True
         )
     else:
         await interaction.response.send_message(
-            "Feed not found.",
+            "Feed not found in this server.",
             ephemeral=True
         )
 
@@ -445,8 +482,11 @@ async def editfeed(interaction: discord.Interaction, name: str,
 @tree.command(name="removefeed", description="Remove a feed")
 @app_commands.checks.has_permissions(administrator=True)
 async def removefeed(interaction: discord.Interaction, name: str):
-    remove_feed(name)
-    log.info(f"Feed removed: {name}")
+
+    guild_id = interaction.guild.id
+    remove_feed(guild_id, name)
+
+    log.info(f"Feed removed: {name} (guild {guild_id})")
     await interaction.response.send_message(
         f"Feed '{name}' removed.",
         ephemeral=True
@@ -469,15 +509,23 @@ async def listfeeds(interaction: discord.Interaction):
 
 
 @tree.command(name="latest", description="Post latest items from a feed")
-async def latest(interaction: discord.Interaction, name: str, count: int = 1):
-    feed = get_feed_by_name(name)
+async def latest(interaction: discord.Interaction,
+                 name: str,
+                 count: int = 1):
+
+    guild_id = interaction.guild.id
+
+    feed = get_feed_by_name(guild_id, name)
     if not feed:
-        await interaction.response.send_message("Feed not found.", ephemeral=True)
+        await interaction.response.send_message(
+            "Feed not found in this server.",
+            ephemeral=True
+        )
         return
 
     count = min(count, MAX_LATEST_COUNT)
 
-    _, _, rss_url, _, _, _, _ = feed
+    _, _, _, rss_url, _, _, _, _ = feed
 
     parsed = feedparser.parse(rss_url)
     entries = parsed.entries if parsed.entries else []
