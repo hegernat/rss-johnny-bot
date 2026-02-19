@@ -103,13 +103,39 @@ def add_feed(name, rss_url, channel_id, interval):
     interval = max(MIN_INTERVAL, min(interval, MAX_INTERVAL))
     now = time.time()
 
+    parsed = feedparser.parse(rss_url)
+    entries = parsed.entries if parsed.entries else []
+
+    latest_timestamp = None
+
+    for entry in entries:
+        if entry.get("published_parsed"):
+            dt = datetime(*entry["published_parsed"][:6])
+            ts = dt.timestamp()
+            if not latest_timestamp or ts > latest_timestamp:
+                latest_timestamp = ts
+
     conn = sqlite3.connect(DB_FILE)
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT INTO feeds (name, rss_url, channel_id, last_time, interval_seconds, last_checked)
+        INSERT INTO feeds (
+            name,
+            rss_url,
+            channel_id,
+            last_time,
+            interval_seconds,
+            last_checked
+        )
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (name, rss_url, channel_id, None, interval, now))
+    """, (
+        name,
+        rss_url,
+        channel_id,
+        latest_timestamp,
+        interval,
+        now
+    ))
 
     conn.commit()
     conn.close()
@@ -252,6 +278,8 @@ async def check_feed(feed):
     feed_id, name, rss_url, channel_id, last_time, interval, last_checked = feed
 
     now = time.time()
+
+    # Interval check
     if last_checked and now - last_checked < interval:
         return
 
@@ -263,39 +291,65 @@ async def check_feed(feed):
         parsed = feedparser.parse(rss_url)
         entries = parsed.entries if parsed.entries else []
 
-        cleaned = [clean_entry(e) for e in entries]
-        cleaned.sort(key=lambda x: x["time"] or datetime.utcnow().timetuple())
+        if not entries:
+            update_last_checked(feed_id)
+            return
 
-        new_entries = []
-        for entry in cleaned:
-            entry_dt = entry_to_datetime(entry)
-            if not entry_dt:
+        # Clean + filter entries WITH timestamps only
+        valid_entries = []
+
+        for raw in entries:
+            if not raw.get("published_parsed"):
                 continue
 
-            if not last_time:
-                new_entries.append(entry)
-            else:
-                stored_dt = datetime.utcfromtimestamp(last_time)
-                if entry_dt > stored_dt:
-                    new_entries.append(entry)
+            cleaned = clean_entry(raw)
+            entry_dt = entry_to_datetime(cleaned)
 
+            if entry_dt:
+                valid_entries.append((entry_dt, cleaned))
+
+        if not valid_entries:
+            log.warning(f"Feed '{name}' has no valid timestamped entries")
+            update_last_checked(feed_id)
+            return
+
+        # Sort oldest → newest
+        valid_entries.sort(key=lambda x: x[0])
+
+        # If last_time is None (should not happen after v1.0.1),
+        # initialize it safely to newest timestamp and exit
+        if not last_time:
+            newest_dt = valid_entries[-1][0]
+            update_last_time(feed_id, newest_dt)
+            update_last_checked(feed_id)
+            log.info(f"Feed '{name}' initialized with latest timestamp")
+            return
+
+        stored_dt = datetime.utcfromtimestamp(last_time)
+
+        # Collect only entries newer than stored timestamp
+        new_entries = [
+            entry for dt, entry in valid_entries
+            if dt > stored_dt
+        ]
+
+        # Anti-flood cap
         new_entries = new_entries[:MAX_POSTS_PER_CHECK]
 
         for entry in new_entries:
             await post_entry(channel, entry)
 
+        # Update last_time ONLY if we posted something
         if new_entries:
             latest_dt = entry_to_datetime(new_entries[-1])
             if latest_dt:
                 update_last_time(feed_id, latest_dt)
+                log.info(f"Feed '{name}': posted {len(new_entries)} new entries")
 
         update_last_checked(feed_id)
 
-        if new_entries:
-            log.info(f"Feed '{name}': posted {len(new_entries)} new entries")
-
     except Exception as e:
-        log.error(f"Error checking feed '{name}': {e}")
+        log.error(f"Error checking feed '{name}': {e}"
 
 
 # ----------------------
